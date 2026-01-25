@@ -1,0 +1,87 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>BANCRIPFUTBOT PRO - Dashboard</title>
+  <style>
+    body{font-family:Arial;background:#0b1220;color:#e8eefc;margin:0}
+    .top{display:flex;justify-content:space-between;align-items:center;padding:16px 20px;background:#0f1a33;border-bottom:1px solid #1c2b52}
+    .badge{padding:6px 10px;border-radius:10px;background:#13224a;border:1px solid #223a73}
+    .wrap{padding:18px}
+    .cards{display:grid;grid-template-columns:repeat(4,minmax(160px,1fr));gap:12px;margin-bottom:12px}
+    .card{background:#0f1a33;border:1px solid #1c2b52;border-radius:14px;padding:14px;box-shadow:0 6px 16px rgba(0,0,0,.2)}
+    .muted{color:#9fb2df}
+    input,button{padding:10px;border-radius:10px;border:1px solid #223a73;background:#0b1220;color:#e8eefc}
+    button{cursor:pointer}
+    a{color:#9fb2df}
+    table{width:100%;border-collapse:collapse;margin-top:10px}
+    th,td{padding:10px;border-bottom:1px solid #1c2b52}
+    th{color:#9fb2df;text-align:left;font-size:12px;text-transform:uppercase}
+    .sideBUY{color:#31d17c;font-weight:700}
+    .sideSELL{color:#ff5c5c;font-weight:700}
+    .sideEXIT{color:#ffd166;font-weight:700}
+  </style>
+</head>
+<body>
+  <div class="top">
+    <div>
+      <div style="font-size:18px;font-weight:700;">📊 BANCRIPFUTBOT PRO</div>
+      <div class="muted" style="font-size:12px;">Sistema de señales con webhook + dashboard</div>
+    </div>
+    <div class="badge">Plan: <b>{{ role }}</b> | <a href="/logout">Salir</a></div>
+  </div>
+
+  <div class="wrap">
+    <div class="cards">
+      <div class="card">
+        <div class="muted">Total señales</div>
+        <div style="font-size:26px;font-weight:800;">{{ total }}</div>
+      </div>
+      <div class="card">
+        <div class="muted">Symbol filtro</div>
+        <div style="font-size:18px;font-weight:700;">{{ symbol if symbol else "—" }}</div>
+      </div>
+      <div class="card">
+        <div class="muted">TF filtro</div>
+        <div style="font-size:18px;font-weight:700;">{{ tf if tf else "—" }}</div>
+      </div>
+      <div class="card">
+        <div class="muted">Side filtro</div>
+        <div style="font-size:18px;font-weight:700;">{{ side if side else "—" }}</div>
+      </div>
+    </div>
+
+    <form method="get" class="card" style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;">
+      <div class="muted">Filtros:</div>
+      <input name="symbol" value="{{ symbol }}" placeholder="BTCUSDT">
+      <input name="tf" value="{{ tf }}" placeholder="15m">
+      <input name="side" value="{{ side }}" placeholder="BUY/SELL/EXIT_LONG">
+      <button>Aplicar</button>
+      <a href="/dashboard">Limpiar</a>
+    </form>
+
+    <div class="card">
+      <div style="font-weight:800;margin-bottom:8px;">Historial (últimas 200)</div>
+      <table>
+        <tr>
+          <th>ID</th><th>UTC</th><th>Symbol</th><th>TF</th><th>Side</th><th>Price</th><th>TP</th><th>SL</th><th>Reason</th>
+        </tr>
+        {% for r in rows %}
+        {% set s = r["side"] %}
+        <tr>
+          <td>{{ r["id"] }}</td>
+          <td class="muted">{{ r["ts_utc"] }}</td>
+          <td><b>{{ r["symbol"] }}</b></td>
+          <td class="muted">{{ r["tf"] }}</td>
+          <td class="{% if 'BUY' in s %}sideBUY{% elif 'SELL' in s %}sideSELL{% else %}sideEXIT{% endif %}">{{ s }}</td>
+          <td>{{ r["price"] }}</td>
+          <td class="muted">{{ r["tp"] }}</td>
+          <td class="muted">{{ r["sl"] }}</td>
+          <td class="muted">{{ r["reason"] }}</td>
+        </tr>
+        {% endfor %}
+      </table>
+    </div>
+  </div>
+</body>
+</html>

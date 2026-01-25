@@ -1,0 +1,18 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>BANCRIPFUTBOT PRO - Login</title></head>
+<body style="font-family:Arial; padding:40px;">
+<h2>🔐 BANCRIPFUTBOT PRO</h2>
+<p>Usuario: <b>admin</b> | Clave: <b>admin123</b></p>
+
+{% with messages = get_flashed_messages() %}
+  {% if messages %}<p style="color:red;">{{ messages[0] }}</p>{% endif %}
+{% endwith %}
+
+<form method="post" action="/login">
+  <input name="username" placeholder="admin" style="padding:10px;width:260px;"><br><br>
+  <input name="password" type="password" placeholder="admin123" style="padding:10px;width:260px;"><br><br>
+  <button style="padding:10px 18px;">Entrar</button>
+</form>
+</body>
+</html>
