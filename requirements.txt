@@ -1,10 +1,7 @@
-# BANCRIPFUTBOT PRO - Dependencias
-Flask==2.3.3
-Flask-CORS==4.0.0
-python-dotenv==1.0.0
-requests==2.31.0
 python-binance==1.0.19
 ta==0.10.2
+pandas==2.2.3
+numpy==2.0.2
+requests==2.31.0
+python-dotenv==1.0.0
 schedule==1.2.0
-gunicorn
-Flask-Login
