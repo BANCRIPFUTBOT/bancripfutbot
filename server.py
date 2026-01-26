@@ -1,24 +1,52 @@
-import os, json
+import os
+import json
+import logging
+from datetime import datetime, timezone
+
 from flask import Flask, request, jsonify, render_template, redirect, url_for, flash
 from werkzeug.security import generate_password_hash, check_password_hash
 from flask_login import LoginManager, login_user, login_required, logout_user, UserMixin, current_user
 import requests
 from dotenv import load_dotenv
 
-from db import init_db, conn, utc_now
+from db import init_db, conn
 
+# -------------------------
+# ENV / CONFIG
+# -------------------------
 load_dotenv()
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 WEBHOOK_PASSPHRASE = os.getenv("WEBHOOK_PASSPHRASE", "BANCRIPFUTBOT").strip()
 
+# Mejor que hardcodear:
+SECRET_KEY = os.getenv("SECRET_KEY", "CHANGE_ME_IN_RENDER").strip()
+
+# Admin configurable (en Render lo pones como variables)
+ADMIN_USER = os.getenv("ADMIN_USER", "admin").strip()
+ADMIN_PASS = os.getenv("ADMIN_PASS", "admin123").strip()
+
+# -------------------------
+# APP
+# -------------------------
 app = Flask(__name__)
-app.secret_key = "BANCRIPFUTBOT_SUPER_SECRET_KEY"  # luego lo cambiamos
+app.secret_key = SECRET_KEY
+
+# Logging (sale bonito en Render)
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("bancripfutbot")
 
 login_manager = LoginManager()
 login_manager.login_view = "login"
 login_manager.init_app(app)
+
+
+# -------------------------
+# HELPERS
+# -------------------------
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 class User(UserMixin):
     def __init__(self, row):
@@ -34,19 +62,20 @@ def load_user(user_id):
     return User(r) if r else None
 
 def ensure_admin():
-    # admin / admin123
+    """Crea el admin si no existe (ADMIN_USER / ADMIN_PASS)."""
     with conn() as c:
-        r = c.execute("SELECT * FROM users WHERE username='admin'").fetchone()
+        r = c.execute("SELECT * FROM users WHERE username=?", (ADMIN_USER,)).fetchone()
         if not r:
             c.execute(
                 "INSERT INTO users(username,password_hash,role) VALUES(?,?,?)",
-                ("admin", generate_password_hash("admin123"), "ADMIN")
+                (ADMIN_USER, generate_password_hash(ADMIN_PASS), "ADMIN")
             )
             c.commit()
+            log.info("✅ Admin creado: %s", ADMIN_USER)
 
 def send_telegram(text: str) -> bool:
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("⚠️ Telegram no configurado (faltan TELEGRAM_BOT_TOKEN o TELEGRAM_CHAT_ID)")
+        log.warning("⚠️ Telegram no configurado (faltan TELEGRAM_BOT_TOKEN o TELEGRAM_CHAT_ID)")
         return False
 
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -54,40 +83,56 @@ def send_telegram(text: str) -> bool:
 
     try:
         r = requests.post(url, json=payload, timeout=20)
-        print("📨 Telegram:", r.status_code, r.text[:200])
+        log.info("📨 Telegram: %s %s", r.status_code, r.text[:200])
         return r.status_code == 200
     except Exception as e:
-        print("❌ Telegram error:", e)
+        log.exception("❌ Telegram error: %s", e)
         return False
 
 def fnum(x):
     try:
         return float(x)
-    except:
+    except Exception:
         return None
 
 def parse_tv_payload():
     """
-    TradingView a veces manda JSON normal (Content-Type application/json)
-    y a veces manda texto plano (raw). Esta función soporta ambas.
+    Soporta TradingView:
+    - application/json
+    - text/plain (raw)
     """
     data = request.get_json(silent=True)
+    if data is not None:
+        return data
 
-    if data is None:
-        raw = request.data.decode("utf-8", errors="ignore").strip()
-        if raw:
-            try:
-                data = json.loads(raw)
-            except Exception:
-                data = {"raw_message": raw}
-        else:
-            data = {}
+    raw = request.data.decode("utf-8", errors="ignore").strip()
+    if not raw:
+        return {}
 
-    return data
+    try:
+        return json.loads(raw)
+    except Exception:
+        return {"raw_message": raw}
+
+def db_insert_signal(ts_utc, symbol, tf, side, price, tp, sl, reason, raw_json):
+    with conn() as c:
+        c.execute(
+            "INSERT INTO signals(ts_utc,symbol,tf,side,price,tp,sl,reason,raw_json) VALUES(?,?,?,?,?,?,?,?,?)",
+            (ts_utc, symbol, tf, side, price, tp, sl, reason, raw_json)
+        )
+        c.commit()
+
+
+# -------------------------
+# ROUTES
+# -------------------------
+@app.get("/health")
+def health():
+    return jsonify({"ok": True, "service": "BANCRIPFUTBOT", "ts": utc_now()}), 200
 
 @app.get("/")
 def home():
-    return jsonify({"status": "BANCRIPFUTBOT PRO ONLINE"}), 200
+    return jsonify({"status": "BANCRIPFUTBOT PRO ONLINE", "ts": utc_now()}), 200
 
 @app.get("/login")
 def login():
@@ -99,6 +144,7 @@ def login():
 def login_post():
     init_db()
     ensure_admin()
+
     u = request.form.get("username", "").strip()
     p = request.form.get("password", "").strip()
 
@@ -154,49 +200,41 @@ def dashboard():
 @app.post("/webhook")
 def webhook():
     init_db()
+    ensure_admin()
 
     data = parse_tv_payload()
-    print("📩 WEBHOOK RECEIVED:", data)
+    log.info("📩 WEBHOOK RECEIVED: %s", str(data)[:500])
 
     if not data:
         return jsonify({"ok": False, "error": "empty body"}), 400
 
-    # Si vino como texto y no como JSON válido
+    # Caso texto no-JSON
     if "raw_message" in data:
-        # Guardamos el raw para debug y avisamos por Telegram
         raw = data.get("raw_message", "")
-        with conn() as c:
-            c.execute(
-                "INSERT INTO signals(ts_utc,symbol,tf,side,price,tp,sl,reason,raw_json) VALUES(?,?,?,?,?,?,?,?,?)",
-                (utc_now(), "RAW", "RAW", "RAW", None, None, None, "RAW_MESSAGE", json.dumps(data))
-            )
-            c.commit()
+        db_insert_signal(
+            utc_now(), "RAW", "RAW", "RAW", None, None, None,
+            "RAW_MESSAGE", json.dumps(data)
+        )
+        send_telegram("⚠️ TradingView envió texto no-JSON:\n" + raw[:3500])
+        return jsonify({"ok": True, "note": "raw_message received"}), 200
 
-        telegram_sent = send_telegram("⚠️ TradingView envió texto no-JSON:\n" + raw[:3500])
-        return jsonify({"ok": True, "telegram_sent": telegram_sent, "note": "raw_message received"}), 200
-
-    # Validación de passphrase
+    # Validación passphrase
     if str(data.get("passphrase", "")).strip() != WEBHOOK_PASSPHRASE:
         return jsonify({"ok": False, "error": "bad passphrase"}), 403
 
-    # Parse campos normales
-    symbol = str(data.get("symbol", "BTCUSDT"))
-    tf = str(data.get("tf", "15m"))
-    side = str(data.get("side", "N/A")).upper()
+    # Parse campos
+    symbol = str(data.get("symbol", "BTCUSDT")).strip().upper()
+    tf = str(data.get("tf", "15m")).strip()
+    side = str(data.get("side", "N/A")).strip().upper()
     price = fnum(data.get("price"))
     tp = fnum(data.get("tp"))
     sl = fnum(data.get("sl"))
-    reason = str(data.get("reason", ""))
+    reason = str(data.get("reason", "")).strip()
 
-    # Guardar en DB
-    with conn() as c:
-        c.execute(
-            "INSERT INTO signals(ts_utc,symbol,tf,side,price,tp,sl,reason,raw_json) VALUES(?,?,?,?,?,?,?,?,?)",
-            (utc_now(), symbol, tf, side, price, tp, sl, reason, json.dumps(data))
-        )
-        c.commit()
+    db_insert_signal(
+        utc_now(), symbol, tf, side, price, tp, sl, reason, json.dumps(data)
+    )
 
-    # Mensaje Telegram
     icon = "🟢" if side == "BUY" else "🔴" if side == "SELL" else "✅"
     msg = (
         f"{icon} BANCRIPFUT PRO SIGNAL\n"
@@ -207,11 +245,17 @@ def webhook():
         f"🛑 SL: {sl}\n"
         f"🧾 {reason}"
     )
-
     telegram_sent = send_telegram(msg)
+
     return jsonify({"ok": True, "telegram_sent": telegram_sent}), 200
 
+
+# -------------------------
+# LOCAL RUN (Render usa gunicorn)
+# -------------------------
 if __name__ == "__main__":
     init_db()
     ensure_admin()
-    app.run(host="0.0.0.0", port=5000, debug=False)
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port, debug=False)
+
