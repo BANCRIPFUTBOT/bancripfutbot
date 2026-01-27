@@ -1,14 +1,7 @@
 Flask==2.3.3
-Flask-CORS==4.0.0
 Flask-Login==0.6.3
+Flask-CORS==4.0.0
 python-dotenv==1.0.0
 requests==2.31.0
 gunicorn==21.2.0
-
-# Binance / indicadores (si los usas)
-python-binance==1.0.19
-ta==0.10.2
-schedule==1.2.0
-
-# Postgres (CLAVE para Render Postgres)
 psycopg2-binary==2.9.9
