@@ -1,119 +1,131 @@
 import os
+import json
 import sqlite3
-from urllib.parse import urlparse
+from contextlib import contextmanager
 from datetime import datetime, timezone
+
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+LOCAL_SQLITE = os.getenv("SQLITE_PATH", "app.db").strip()
 
 def utc_now():
     return datetime.now(timezone.utc).isoformat()
 
-def _sqlite_conn():
-    # SQLite local (fallback)
-    db_path = os.path.join(os.path.dirname(__file__), "data", "bancripfutbot.db")
-    os.makedirs(os.path.dirname(db_path), exist_ok=True)
-    c = sqlite3.connect(db_path)
-    c.row_factory = sqlite3.Row
-    return c
+def _is_postgres():
+    return DATABASE_URL.startswith("postgres://") or DATABASE_URL.startswith("postgresql://")
 
-def _postgres_conn():
-    """
-    Postgres via DATABASE_URL (Render).
-    Usa psycopg2-binary.
-    """
-    import psycopg2
-    import psycopg2.extras
+def _normalize_pg_url(url: str) -> str:
+    # Render a veces da postgres://, psycopg2 acepta mejor postgresql://
+    if url.startswith("postgres://"):
+        url = "postgresql://" + url[len("postgres://"):]
+    return url
 
-    url = os.getenv("DATABASE_URL", "").strip()
-    if not url:
-        raise RuntimeError("DATABASE_URL vacío")
-
-    # Render a veces usa postgres:// (ok). En algunos servicios puede venir postgresql://
-    parsed = urlparse(url)
-    dbname = parsed.path.lstrip("/")
-    user = parsed.username
-    password = parsed.password
-    host = parsed.hostname
-    port = parsed.port or 5432
-
-    conn = psycopg2.connect(
-        dbname=dbname,
-        user=user,
-        password=password,
-        host=host,
-        port=port,
-        sslmode=os.getenv("PGSSLMODE", "require"),
-    )
-    conn.autocommit = True
-    return conn
-
+@contextmanager
 def conn():
     """
-    Devuelve un context manager-like para usar con `with conn() as c:`
-    - SQLite: devuelve connection sqlite
-    - Postgres: devuelve connection psycopg2
+    Devuelve una conexión con una interfaz 'c.execute(...)' compatible.
+    - En SQLite usa sqlite3.
+    - En Postgres usa psycopg2 + cursor tipo dict.
+    Además convierte placeholders '?' (SQLite) a '%s' (Postgres).
     """
-    db_url = os.getenv("DATABASE_URL", "").strip()
-    if db_url:
-        return _postgres_conn()
-    return _sqlite_conn()
+    if _is_postgres():
+        import psycopg2
+        from psycopg2.extras import RealDictCursor
+
+        url = _normalize_pg_url(DATABASE_URL)
+
+        # Render Postgres suele requerir SSL
+        # Si tu DATABASE_URL ya trae ?sslmode=require, no pasa nada.
+        if "sslmode=" not in url:
+            joiner = "&" if "?" in url else "?"
+            url = url + joiner + "sslmode=require"
+
+        pg = psycopg2.connect(url, cursor_factory=RealDictCursor)
+        try:
+            cur = pg.cursor()
+
+            class PGCompat:
+                def execute(self, q, params=()):
+                    # Convierte ? ? ? a %s %s %s para Postgres
+                    if params is None:
+                        params = ()
+                    if "?" in q:
+                        q = q.replace("?", "%s")
+                    cur.execute(q, params)
+                    return self
+
+                def fetchone(self):
+                    return cur.fetchone()
+
+                def fetchall(self):
+                    return cur.fetchall()
+
+                def commit(self):
+                    pg.commit()
+
+                def close(self):
+                    try:
+                        cur.close()
+                    except:
+                        pass
+                    try:
+                        pg.close()
+                    except:
+                        pass
+
+            c = PGCompat()
+            yield c
+        finally:
+            try:
+                pg.commit()
+            except:
+                pass
+            try:
+                pg.close()
+            except:
+                pass
+
+    else:
+        db = sqlite3.connect(LOCAL_SQLITE)
+        db.row_factory = sqlite3.Row
+        try:
+            yield db
+        finally:
+            db.commit()
+            db.close()
 
 def init_db():
     """
     Crea tablas si no existen.
-    Soporta SQLite y Postgres.
+    Compatible con Postgres y SQLite.
     """
-    db_url = os.getenv("DATABASE_URL", "").strip()
-
-    if db_url:
-        # POSTGRES
-        with conn() as c:
-            cur = c.cursor(cursor_factory=None)
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS users (
-                    id SERIAL PRIMARY KEY,
-                    username TEXT UNIQUE NOT NULL,
-                    password_hash TEXT NOT NULL,
-                    role TEXT NOT NULL DEFAULT 'USER'
-                );
-            """)
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS signals (
-                    id SERIAL PRIMARY KEY,
-                    ts_utc TEXT NOT NULL,
-                    symbol TEXT,
-                    tf TEXT,
-                    side TEXT,
-                    price DOUBLE PRECISION,
-                    tp DOUBLE PRECISION,
-                    sl DOUBLE PRECISION,
-                    reason TEXT,
-                    raw_json TEXT
-                );
-            """)
-        return
-
-    # SQLITE
     with conn() as c:
+        # users
         c.execute("""
-            CREATE TABLE IF NOT EXISTS users (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                username TEXT UNIQUE NOT NULL,
-                password_hash TEXT NOT NULL,
-                role TEXT NOT NULL DEFAULT 'USER'
-            );
+        CREATE TABLE IF NOT EXISTS users (
+            id SERIAL PRIMARY KEY,
+            username TEXT UNIQUE NOT NULL,
+            password_hash TEXT NOT NULL,
+            role TEXT NOT NULL
+        )
         """)
+        # signals
         c.execute("""
-            CREATE TABLE IF NOT EXISTS signals (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                ts_utc TEXT NOT NULL,
-                symbol TEXT,
-                tf TEXT,
-                side TEXT,
-                price REAL,
-                tp REAL,
-                sl REAL,
-                reason TEXT,
-                raw_json TEXT
-            );
+        CREATE TABLE IF NOT EXISTS signals (
+            id SERIAL PRIMARY KEY,
+            ts_utc TEXT NOT NULL,
+            symbol TEXT,
+            tf TEXT,
+            side TEXT,
+            price DOUBLE PRECISION,
+            tp DOUBLE PRECISION,
+            sl DOUBLE PRECISION,
+            reason TEXT,
+            raw_json TEXT
+        )
         """)
-        c.commit()
+        try:
+            c.commit()
+        except:
+            pass
+
 
