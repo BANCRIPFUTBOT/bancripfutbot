@@ -9,21 +9,19 @@ from db import init_db, conn, utc_now
 
 load_dotenv()
 
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-WEBHOOK_PASSPHRASE = os.getenv("WEBHOOK_PASSPHRASE", "BANCRIPFUTBOT").strip()
-
-# Render/Gunicorn
-PORT = int(os.getenv("PORT", "5000"))
+TELEGRAM_BOT_TOKEN   = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_CHAT_ID     = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+WEBHOOK_PASSPHRASE   = os.getenv("WEBHOOK_PASSPHRASE", "BANCRIPFUTBOT").strip()
+SECRET_KEY           = os.getenv("SECRET_KEY", "DEV_ONLY_CHANGE_ME").strip()
 
 app = Flask(__name__)
-# En Render configura SECRET_KEY en Environment (no hardcode)
-app.secret_key = os.getenv("SECRET_KEY", "CHANGE_ME_IN_RENDER")
+app.secret_key = SECRET_KEY
 
 login_manager = LoginManager()
 login_manager.login_view = "login"
 login_manager.init_app(app)
 
+# ---------------- USERS ----------------
 class User(UserMixin):
     def __init__(self, row):
         self.id = row["id"]
@@ -38,7 +36,7 @@ def load_user(user_id):
     return User(r) if r else None
 
 def ensure_admin():
-    # admin / admin123
+    # crea admin/admin123 si no existe
     with conn() as c:
         r = c.execute("SELECT * FROM users WHERE username='admin'").fetchone()
         if not r:
@@ -48,6 +46,10 @@ def ensure_admin():
             )
             c.commit()
 
+def is_admin():
+    return hasattr(current_user, "role") and current_user.role == "ADMIN"
+
+# ---------------- TELEGRAM ----------------
 def send_telegram(text: str) -> bool:
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         print("⚠️ Telegram no configurado (faltan TELEGRAM_BOT_TOKEN o TELEGRAM_CHAT_ID)")
@@ -55,7 +57,6 @@ def send_telegram(text: str) -> bool:
 
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text}
-
     try:
         r = requests.post(url, json=payload, timeout=20)
         print("📨 Telegram:", r.status_code, r.text[:200])
@@ -71,6 +72,9 @@ def fnum(x):
         return None
 
 def parse_tv_payload():
+    """
+    TradingView a veces manda JSON normal y a veces texto plano.
+    """
     data = request.get_json(silent=True)
     if data is None:
         raw = request.data.decode("utf-8", errors="ignore").strip()
@@ -83,14 +87,14 @@ def parse_tv_payload():
             data = {}
     return data
 
-# ---- Health checks (Render friendly)
-@app.get("/health")
-def health():
-    return jsonify({"ok": True, "service": "bancripfutbot"}), 200
-
+# ---------------- ROUTES ----------------
 @app.get("/")
 def home():
     return jsonify({"status": "BANCRIPFUTBOT PRO ONLINE"}), 200
+
+@app.get("/health")
+def health():
+    return jsonify({"ok": True}), 200
 
 @app.get("/login")
 def login():
@@ -102,7 +106,6 @@ def login():
 def login_post():
     init_db()
     ensure_admin()
-
     u = request.form.get("username", "").strip()
     p = request.form.get("password", "").strip()
 
@@ -145,6 +148,10 @@ def dashboard():
         rows = c.execute(q, tuple(params)).fetchall()
         total = c.execute("SELECT COUNT(*) n FROM signals").fetchone()["n"]
 
+        # stats simples para el panel
+        buys  = c.execute("SELECT COUNT(*) n FROM signals WHERE side='BUY'").fetchone()["n"]
+        sells = c.execute("SELECT COUNT(*) n FROM signals WHERE side='SELL'").fetchone()["n"]
+
     return render_template(
         "dashboard.html",
         rows=rows,
@@ -152,20 +159,39 @@ def dashboard():
         symbol=symbol,
         tf=tf,
         side=side,
-        role=current_user.role
+        role=current_user.role,
+        buys=buys,
+        sells=sells
     )
+
+@app.get("/export.csv")
+@login_required
+def export_csv():
+    # solo ADMIN (para empezar)
+    if not is_admin():
+        return "Forbidden", 403
+
+    with conn() as c:
+        rows = c.execute("SELECT id, ts_utc, symbol, tf, side, price, tp, sl, reason FROM signals ORDER BY id DESC LIMIT 2000").fetchall()
+
+    # CSV manual
+    lines = ["id,ts_utc,symbol,tf,side,price,tp,sl,reason"]
+    for r in rows:
+        reason = (r["reason"] or "").replace('"', '""')
+        lines.append(f'{r["id"]},{r["ts_utc"]},{r["symbol"]},{r["tf"]},{r["side"]},{r["price"]},{r["tp"]},{r["sl"]},"{reason}"')
+
+    return app.response_class("\n".join(lines), mimetype="text/csv")
 
 @app.post("/webhook")
 def webhook():
     init_db()
-
     data = parse_tv_payload()
     print("📩 WEBHOOK RECEIVED:", data)
 
     if not data:
         return jsonify({"ok": False, "error": "empty body"}), 400
 
-    # raw no-json
+    # si vino texto raro
     if "raw_message" in data:
         raw = data.get("raw_message", "")
         with conn() as c:
@@ -174,20 +200,20 @@ def webhook():
                 (utc_now(), "RAW", "RAW", "RAW", None, None, None, "RAW_MESSAGE", json.dumps(data))
             )
             c.commit()
-
-        telegram_sent = send_telegram("⚠️ TradingView envió texto no-JSON:\n" + raw[:3500])
-        return jsonify({"ok": True, "telegram_sent": telegram_sent, "note": "raw_message received"}), 200
+        send_telegram("⚠️ TradingView mandó texto no-JSON:\n" + raw[:3500])
+        return jsonify({"ok": True, "telegram_sent": True, "note": "raw"}), 200
 
     # passphrase
     if str(data.get("passphrase", "")).strip() != WEBHOOK_PASSPHRASE:
         return jsonify({"ok": False, "error": "bad passphrase"}), 403
 
+    # campos
     symbol = str(data.get("symbol", "BTCUSDT"))
-    tf = str(data.get("tf", "15m"))
-    side = str(data.get("side", "N/A")).upper()
-    price = fnum(data.get("price"))
-    tp = fnum(data.get("tp"))
-    sl = fnum(data.get("sl"))
+    tf     = str(data.get("tf", "15m"))
+    side   = str(data.get("side", "N/A")).upper()
+    price  = fnum(data.get("price"))
+    tp     = fnum(data.get("tp"))
+    sl     = fnum(data.get("sl"))
     reason = str(data.get("reason", ""))
 
     with conn() as c:
@@ -207,14 +233,13 @@ def webhook():
         f"🛑 SL: {sl}\n"
         f"🧾 {reason}"
     )
-
     telegram_sent = send_telegram(msg)
+
     return jsonify({"ok": True, "telegram_sent": telegram_sent}), 200
 
-# Inicializa DB al boot (sirve en Gunicorn/Render)
-init_db()
-ensure_admin()
-
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=PORT, debug=False)
+    init_db()
+    ensure_admin()
+    port = int(os.getenv("PORT", "5000"))
+    app.run(host="0.0.0.0", port=port, debug=False)
 
