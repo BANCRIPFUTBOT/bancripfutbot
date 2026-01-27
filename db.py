@@ -4,15 +4,13 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 
-# Postgres
-import psycopg2
-from psycopg2.extras import RealDictCursor
-
 DB_PATH = os.getenv("SQLITE_PATH", "app.db")
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 
+
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
 
 def _with_sslmode_require(url: str) -> str:
     """
@@ -32,18 +30,21 @@ def _with_sslmode_require(url: str) -> str:
     except Exception:
         return url
 
+
 def _is_postgres() -> bool:
     return DATABASE_URL.lower().startswith(("postgres://", "postgresql://"))
 
+
 class DBSession:
     """
-    Para que tu server.py siga usando:
+    Compatible con tu uso actual:
         with conn() as c:
             c.execute(...)
             c.fetchone()
             c.fetchall()
             c.commit()
-    Compatible con SQLite y Postgres.
+
+    Soporta SQLite y Postgres (psycopg v3).
     """
     def __init__(self):
         self.kind = "postgres" if _is_postgres() else "sqlite"
@@ -52,8 +53,12 @@ class DBSession:
 
     def __enter__(self):
         if self.kind == "postgres":
+            # psycopg v3
+            import psycopg
+            from psycopg.rows import dict_row
+
             url = _with_sslmode_require(DATABASE_URL)
-            self._conn = psycopg2.connect(url, cursor_factory=RealDictCursor)
+            self._conn = psycopg.connect(url, row_factory=dict_row)
             self._cur = self._conn.cursor()
         else:
             self._conn = sqlite3.connect(DB_PATH)
@@ -94,12 +99,17 @@ class DBSession:
         return self._cur.fetchall()
 
     def commit(self):
-        self._conn.commit()
+        try:
+            self._conn.commit()
+        except Exception:
+            pass
+
 
 @contextmanager
 def conn():
     with DBSession() as s:
         yield s
+
 
 def init_db():
     """
