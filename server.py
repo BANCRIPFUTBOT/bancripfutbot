@@ -1,4 +1,7 @@
 import os, json
+import hmac, hashlib, time
+from collections import OrderedDict
+
 from flask import Flask, request, jsonify, render_template, redirect, url_for, flash
 from werkzeug.security import generate_password_hash, check_password_hash
 from flask_login import LoginManager, login_user, login_required, logout_user, UserMixin, current_user
@@ -7,13 +10,27 @@ from dotenv import load_dotenv
 
 from db import init_db, conn, utc_now
 
+
+# =========================
+# CARGA ENV
+# =========================
 load_dotenv()
 
-TELEGRAM_BOT_TOKEN   = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-TELEGRAM_CHAT_ID     = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-WEBHOOK_PASSPHRASE   = os.getenv("WEBHOOK_PASSPHRASE", "BANCRIPFUTBOT").strip()
-SECRET_KEY           = os.getenv("SECRET_KEY", "DEV_ONLY_CHANGE_ME").strip()
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
+WEBHOOK_PASSPHRASE = os.getenv("WEBHOOK_PASSPHRASE", "BANCRIPFUTBOT").strip()
+
+# ✅ Firma HMAC (seguridad webhook)
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").encode("utf-8")
+MAX_SKEW = int(os.getenv("WEBHOOK_MAX_SKEW_SECONDS", "120"))  # tolerancia reloj (seg)
+
+SECRET_KEY = os.getenv("SECRET_KEY", "DEV_ONLY_CHANGE_ME").strip()
+
+
+# =========================
+# APP
+# =========================
 app = Flask(__name__)
 app.secret_key = SECRET_KEY
 
@@ -21,9 +38,13 @@ login_manager = LoginManager()
 login_manager.login_view = "login"
 login_manager.init_app(app)
 
-# ---------------- USERS ----------------
+
+# =========================
+# USERS (Flask-Login)
+# =========================
 class User(UserMixin):
     def __init__(self, row):
+        # row puede ser sqlite3.Row o dict (postgres)
         self.id = row["id"]
         self.username = row["username"]
         self.password_hash = row["password_hash"]
@@ -49,7 +70,10 @@ def ensure_admin():
 def is_admin():
     return hasattr(current_user, "role") and current_user.role == "ADMIN"
 
-# ---------------- TELEGRAM ----------------
+
+# =========================
+# TELEGRAM
+# =========================
 def send_telegram(text: str) -> bool:
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         print("⚠️ Telegram no configurado (faltan TELEGRAM_BOT_TOKEN o TELEGRAM_CHAT_ID)")
@@ -65,6 +89,10 @@ def send_telegram(text: str) -> bool:
         print("❌ Telegram error:", e)
         return False
 
+
+# =========================
+# UTILIDADES
+# =========================
 def fnum(x):
     try:
         return float(x)
@@ -87,7 +115,91 @@ def parse_tv_payload():
             data = {}
     return data
 
-# ---------------- ROUTES ----------------
+
+# =========================
+# WEBHOOK SECURITY (HMAC + anti-replay)
+# =========================
+_NONCE_CACHE = OrderedDict()
+_NONCE_LIMIT = 2000
+
+def _clean_nonce_cache():
+    while len(_NONCE_CACHE) > _NONCE_LIMIT:
+        _NONCE_CACHE.popitem(last=False)
+
+def _seen_nonce(nonce: str) -> bool:
+    now = int(time.time())
+    # purga nonces viejos (más de 10 min)
+    for k, ts in list(_NONCE_CACHE.items()):
+        if now - ts > 600:
+            _NONCE_CACHE.pop(k, None)
+        else:
+            break
+    if nonce in _NONCE_CACHE:
+        return True
+    _NONCE_CACHE[nonce] = now
+    _clean_nonce_cache()
+    return False
+
+def _canonical_payload(data: dict) -> str:
+    # JSON determinístico: ordena keys y sin espacios
+    return json.dumps(data, separators=(",", ":"), sort_keys=True)
+
+def _hmac_hex(message: str) -> str:
+    if not WEBHOOK_SECRET:
+        return ""
+    return hmac.new(WEBHOOK_SECRET, message.encode("utf-8"), hashlib.sha256).hexdigest()
+
+def verify_webhook_signature(data: dict) -> (bool, str):
+    """
+    Requiere:
+      - ts: unix seconds (int)
+      - nonce: string
+      - sig: hex hmac sha256 (64 chars)
+
+    Firma = HMAC_SHA256(secret, f"{ts}.{nonce}.{canonical_json_without_sig}")
+
+    canonical_json_without_sig = json compacto (sort_keys) del payload SIN 'sig'
+    """
+    if not WEBHOOK_SECRET:
+        return False, "WEBHOOK_SECRET not set"
+
+    try:
+        ts = int(data.get("ts"))
+    except Exception:
+        return False, "missing/invalid ts"
+
+    nonce = str(data.get("nonce", "")).strip()
+    sig = str(data.get("sig", "")).strip().lower()
+
+    if not nonce or len(nonce) < 8:
+        return False, "missing/invalid nonce"
+    if not sig or len(sig) != 64:
+        return False, "missing/invalid sig"
+
+    now = int(time.time())
+    if abs(now - ts) > MAX_SKEW:
+        return False, f"ts skew too large ({now-ts}s)"
+
+    if _seen_nonce(nonce):
+        return False, "replay detected (nonce reused)"
+
+    # Firmamos sin el campo sig
+    d2 = dict(data)
+    d2.pop("sig", None)
+
+    canon = _canonical_payload(d2)
+    msg = f"{ts}.{nonce}.{canon}"
+    expected = _hmac_hex(msg)
+
+    if not hmac.compare_digest(expected, sig):
+        return False, "bad signature"
+
+    return True, "ok"
+
+
+# =========================
+# ROUTES
+# =========================
 @app.get("/")
 def home():
     return jsonify({"status": "BANCRIPFUTBOT PRO ONLINE"}), 200
@@ -96,6 +208,8 @@ def home():
 def health():
     return jsonify({"ok": True}), 200
 
+
+# ---- LOGIN UI ----
 @app.get("/login")
 def login():
     init_db()
@@ -125,6 +239,8 @@ def logout():
     logout_user()
     return redirect(url_for("login"))
 
+
+# ---- DASHBOARD ----
 @app.get("/dashboard")
 @login_required
 def dashboard():
@@ -148,7 +264,6 @@ def dashboard():
         rows = c.execute(q, tuple(params)).fetchall()
         total = c.execute("SELECT COUNT(*) n FROM signals").fetchone()["n"]
 
-        # stats simples para el panel
         buys  = c.execute("SELECT COUNT(*) n FROM signals WHERE side='BUY'").fetchone()["n"]
         sells = c.execute("SELECT COUNT(*) n FROM signals WHERE side='SELL'").fetchone()["n"]
 
@@ -164,24 +279,32 @@ def dashboard():
         sells=sells
     )
 
+
+# ---- EXPORT ----
 @app.get("/export.csv")
 @login_required
 def export_csv():
-    # solo ADMIN (para empezar)
     if not is_admin():
         return "Forbidden", 403
 
     with conn() as c:
-        rows = c.execute("SELECT id, ts_utc, symbol, tf, side, price, tp, sl, reason FROM signals ORDER BY id DESC LIMIT 2000").fetchall()
+        rows = c.execute(
+            "SELECT id, ts_utc, symbol, tf, side, price, tp, sl, reason "
+            "FROM signals ORDER BY id DESC LIMIT 2000"
+        ).fetchall()
 
-    # CSV manual
     lines = ["id,ts_utc,symbol,tf,side,price,tp,sl,reason"]
     for r in rows:
         reason = (r["reason"] or "").replace('"', '""')
-        lines.append(f'{r["id"]},{r["ts_utc"]},{r["symbol"]},{r["tf"]},{r["side"]},{r["price"]},{r["tp"]},{r["sl"]},"{reason}"')
+        lines.append(
+            f'{r["id"]},{r["ts_utc"]},{r["symbol"]},{r["tf"]},{r["side"]},'
+            f'{r["price"]},{r["tp"]},{r["sl"]},"{reason}"'
+        )
 
     return app.response_class("\n".join(lines), mimetype="text/csv")
 
+
+# ---- WEBHOOK (TradingView) ----
 @app.post("/webhook")
 def webhook():
     init_db()
@@ -191,23 +314,29 @@ def webhook():
     if not data:
         return jsonify({"ok": False, "error": "empty body"}), 400
 
-    # si vino texto raro
+    # Si vino texto raro (no JSON)
     if "raw_message" in data:
         raw = data.get("raw_message", "")
         with conn() as c:
             c.execute(
-                "INSERT INTO signals(ts_utc,symbol,tf,side,price,tp,sl,reason,raw_json) VALUES(?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO signals(ts_utc,symbol,tf,side,price,tp,sl,reason,raw_json) "
+                "VALUES(?,?,?,?,?,?,?,?,?)",
                 (utc_now(), "RAW", "RAW", "RAW", None, None, None, "RAW_MESSAGE", json.dumps(data))
             )
             c.commit()
         send_telegram("⚠️ TradingView mandó texto no-JSON:\n" + raw[:3500])
         return jsonify({"ok": True, "telegram_sent": True, "note": "raw"}), 200
 
-    # passphrase
+    # 1) passphrase
     if str(data.get("passphrase", "")).strip() != WEBHOOK_PASSPHRASE:
         return jsonify({"ok": False, "error": "bad passphrase"}), 403
 
-    # campos
+    # 2) firma HMAC (ts/nonce/sig)
+    ok_sig, why = verify_webhook_signature(data)
+    if not ok_sig:
+        return jsonify({"ok": False, "error": "bad_signature", "detail": why}), 403
+
+    # 3) campos
     symbol = str(data.get("symbol", "BTCUSDT"))
     tf     = str(data.get("tf", "15m"))
     side   = str(data.get("side", "N/A")).upper()
@@ -216,13 +345,16 @@ def webhook():
     sl     = fnum(data.get("sl"))
     reason = str(data.get("reason", ""))
 
+    # 4) guardar en DB
     with conn() as c:
         c.execute(
-            "INSERT INTO signals(ts_utc,symbol,tf,side,price,tp,sl,reason,raw_json) VALUES(?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO signals(ts_utc,symbol,tf,side,price,tp,sl,reason,raw_json) "
+            "VALUES(?,?,?,?,?,?,?,?,?)",
             (utc_now(), symbol, tf, side, price, tp, sl, reason, json.dumps(data))
         )
         c.commit()
 
+    # 5) enviar Telegram
     icon = "🟢" if side == "BUY" else "🔴" if side == "SELL" else "✅"
     msg = (
         f"{icon} BANCRIPFUT PRO SIGNAL\n"
@@ -237,9 +369,13 @@ def webhook():
 
     return jsonify({"ok": True, "telegram_sent": telegram_sent}), 200
 
+
+# =========================
+# RUN LOCAL
+# =========================
 if __name__ == "__main__":
     init_db()
     ensure_admin()
     port = int(os.getenv("PORT", "5000"))
+    print(f"🚀 BANCRIPFUTBOT PRO iniciando en puerto {port}")
     app.run(host="0.0.0.0", port=port, debug=False)
-
